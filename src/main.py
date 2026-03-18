@@ -16,6 +16,7 @@ from src.market_maker.quote_engine import QuoteEngine
 from src.polymarket.order_signer import OrderSigner
 from src.polymarket.rest_client import PolymarketRestClient
 from src.polymarket.websocket_client import PolymarketWebSocketClient
+from src.risk.adverse_selection import AdverseSelectionGuard
 from src.risk.risk_manager import RiskManager
 from src.services import AutoRedeem, start_metrics_server
 from src.services.metrics import (
@@ -51,6 +52,9 @@ class MarketMakerBot:
         self.quote_engine = QuoteEngine(settings, self.inventory_manager)
 
         self.auto_redeem = AutoRedeem(settings)
+
+        # Adverse selection protection
+        self.as_guard = AdverseSelectionGuard(settings)
 
         # Reward-optimized strategy components
         self.reward_client = RewardClient(settings)
@@ -174,9 +178,17 @@ class MarketMakerBot:
         # Check if we should widen spread for uptime instead of pulling
         widen = self.uptime_tracker.should_widen_instead_of_pull(market_id)
 
-        # Record price for volatility tracking
+        # Record price for volatility tracking + adverse selection detection
         mid = (best_bid + best_ask) / 2.0
         self.market_selector.record_price(market_id, mid)
+        self.as_guard.record_price(market_id, mid)
+
+        # Adverse selection guard: get combined spread multiplier
+        as_mult = max(
+            self.as_guard.get_event_spread_multiplier(market_id),
+            self.as_guard.detect_momentum(market_id),
+            self.as_guard.get_state(market_id).spread_multiplier,
+        )
 
         yes_quote, no_quote = self.quote_engine.generate_quotes(
             market_id=market_id,
@@ -189,6 +201,7 @@ class MarketMakerBot:
             breakeven_spread_bps=breakeven_bps,
             allocated_capital=allocated_capital,
             widen_for_uptime=widen,
+            as_spread_multiplier=as_mult,
         )
 
         await self._cancel_stale_orders(market_id)
@@ -231,6 +244,15 @@ class MarketMakerBot:
 
         if not is_valid:
             logger.warning("quote_rejected", reason=reason, outcome=outcome, market=quote.market)
+            return
+
+        # Adverse selection guard: check exposure cap + momentum
+        mid = quote.price  # approximate
+        as_ok, as_mult, as_reason = self.as_guard.check_quote(
+            quote.market, outcome, quote.price, quote.size, mid
+        )
+        if not as_ok:
+            logger.warning("as_guard_blocked", reason=as_reason, outcome=outcome, market=quote.market)
             return
 
         try:

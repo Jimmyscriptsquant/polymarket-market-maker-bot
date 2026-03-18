@@ -126,6 +126,7 @@ class QuoteEngine:
         breakeven_spread_bps: float = 0.0,
         allocated_capital: float = 0.0,
         widen_for_uptime: bool = False,
+        as_spread_multiplier: float = 1.0,
     ) -> tuple[Quote | None, Quote | None]:
         mid_price = self.calculate_mid_price(best_bid, best_ask)
 
@@ -150,6 +151,10 @@ class QuoteEngine:
         # Widen spread during volatility instead of pulling quotes (uptime strategy)
         if is_volatile or widen_for_uptime:
             spread_bps = int(spread_bps * self.settings.wide_spread_multiplier)
+
+        # Apply adverse selection guard multiplier (event timing, momentum, fill patterns)
+        if as_spread_multiplier > 1.0:
+            spread_bps = int(spread_bps * as_spread_multiplier)
             logger.info(
                 "spread_widened_for_uptime",
                 market_id=market_id,
