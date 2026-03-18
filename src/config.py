@@ -76,6 +76,22 @@ class Settings(BaseSettings):
     # RPC endpoint for on-chain operations
     rpc_url: str = Field(default="https://polygon-rpc.com", description="Polygon RPC endpoint")
 
+    # Reward program
+    rewards_api_url: str = Field(
+        default="https://clob.polymarket.com/rewards", description="Polymarket rewards API"
+    )
+    reward_adjusted_spreads: bool = Field(default=True, description="Enable reward-adjusted spread calculation")
+    target_markets_count: int = Field(default=10, description="Number of top markets to trade simultaneously")
+    market_rotation_interval_s: int = Field(default=3600, description="Market re-ranking interval in seconds")
+    min_reward_rate_daily: float = Field(default=1.0, description="Minimum daily reward rate USD to consider")
+    max_volatility_threshold: float = Field(default=0.15, description="Max realized volatility to LP in")
+    capital_pool_usd: float = Field(default=50000.0, description="Total capital pool across all markets")
+
+    # Uptime
+    uptime_target_pct: float = Field(default=95.0, description="Target quote uptime percentage")
+    wide_spread_multiplier: float = Field(default=3.0, description="Spread multiplier during volatility (vs pulling)")
+    volatility_widen_threshold: float = Field(default=0.05, description="Price move % to trigger spread widening")
+
 
 _settings: Settings | None = None
 
