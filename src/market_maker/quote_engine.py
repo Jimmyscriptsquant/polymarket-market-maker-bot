@@ -26,7 +26,7 @@ class QuoteEngine:
     def __init__(self, settings: Settings, inventory_manager: InventoryManager):
         self.settings = settings
         self.inventory_manager = inventory_manager
-        self._last_mid_prices: dict[str, list[float]] = {}  # market -> recent mids for vol detection
+        self._last_mid_prices: dict[str, list[float]] = {}
 
     def calculate_bid_price(self, mid_price: float, spread_bps: int) -> float:
         return mid_price * (1 - spread_bps / 10000)
@@ -34,7 +34,55 @@ class QuoteEngine:
     def calculate_ask_price(self, mid_price: float, spread_bps: int) -> float:
         return mid_price * (1 + spread_bps / 10000)
 
+    def calculate_weighted_mid(self, orderbook: dict[str, Any]) -> float:
+        """Calculate volume-weighted mid price from top N levels of the book.
+
+        Uses top 3 levels of bids and asks, weighted by size, instead of
+        naive (best_bid + best_ask) / 2. This gives a better fair value
+        estimate in thin books.
+        """
+        bids = orderbook.get("bids", [])
+        asks = orderbook.get("asks", [])
+
+        if not bids or not asks:
+            return 0.0
+
+        # Weight by top 3 levels
+        bid_value = 0.0
+        bid_size = 0.0
+        for level in bids[:3]:
+            p = float(level.get("price", 0))
+            s = float(level.get("size", 0))
+            bid_value += p * s
+            bid_size += s
+
+        ask_value = 0.0
+        ask_size = 0.0
+        for level in asks[:3]:
+            p = float(level.get("price", 0))
+            s = float(level.get("size", 0))
+            ask_value += p * s
+            ask_size += s
+
+        if bid_size <= 0 or ask_size <= 0:
+            # Fallback to simple mid
+            best_bid = float(bids[0].get("price", 0)) if bids else 0
+            best_ask = float(asks[0].get("price", 0)) if asks else 0
+            if best_bid > 0 and best_ask > 0:
+                return (best_bid + best_ask) / 2.0
+            return 0.0
+
+        vwap_bid = bid_value / bid_size
+        vwap_ask = ask_value / ask_size
+
+        # Weight mid by relative sizes (more liquidity = more weight)
+        total_size = bid_size + ask_size
+        weighted_mid = (vwap_bid * bid_size + vwap_ask * ask_size) / total_size
+
+        return weighted_mid
+
     def calculate_mid_price(self, best_bid: float, best_ask: float) -> float:
+        """Simple mid price fallback."""
         if best_bid <= 0 or best_ask <= 0:
             return 0.0
         return (best_bid + best_ask) / 2.0
@@ -47,31 +95,14 @@ class QuoteEngine:
         volume_24h: float = 0.0,
         breakeven_spread_bps: float = 0.0,
     ) -> int:
-        """Calculate optimal spread accounting for reward subsidies.
-
-        Key insight: if rewards subsidize your spread enough, you can quote
-        tighter than fair and still profit.
-
-        adjusted_spread = max(
-            breakeven_spread (from market selector),
-            adverse_selection - reward_subsidy_per_fill,
-            min_spread_bps floor
-        )
-        """
+        """Calculate optimal spread accounting for reward subsidies."""
         if not self.settings.reward_adjusted_spreads or reward_rate_daily <= 0:
             return base_spread_bps
 
-        # Estimate expected fills per day based on our share of volume
-        # Conservative: assume we capture 5% of daily volume
         expected_daily_fills = max((volume_24h * 0.05) / self.settings.default_size, 1.0)
-
-        # Reward subsidy per fill in USD
         reward_per_fill = reward_rate_daily / expected_daily_fills
-
-        # Convert subsidy to bps: subsidy / order_size * 10000
         subsidy_bps = (reward_per_fill / self.settings.default_size) * 10000
 
-        # Tighten spread by the subsidy amount
         adjusted = max(
             base_spread_bps - int(subsidy_bps),
             int(breakeven_spread_bps) if breakeven_spread_bps > 0 else 1,
@@ -91,11 +122,10 @@ class QuoteEngine:
         return adjusted
 
     def detect_short_term_volatility(self, market_id: str, mid_price: float) -> bool:
-        """Detect if recent price action is volatile (for uptime-aware widening)."""
+        """Detect if recent price action is volatile."""
         history = self._last_mid_prices.setdefault(market_id, [])
         history.append(mid_price)
 
-        # Keep last 20 observations
         if len(history) > 20:
             self._last_mid_prices[market_id] = history[-20:]
             history = self._last_mid_prices[market_id]
@@ -103,7 +133,6 @@ class QuoteEngine:
         if len(history) < 5:
             return False
 
-        # Check max move in recent window
         recent = history[-10:]
         max_price = max(recent)
         min_price = min(recent)
@@ -127,19 +156,21 @@ class QuoteEngine:
         allocated_capital: float = 0.0,
         widen_for_uptime: bool = False,
         as_spread_multiplier: float = 1.0,
+        orderbook: dict[str, Any] | None = None,
     ) -> tuple[Quote | None, Quote | None]:
-        mid_price = self.calculate_mid_price(best_bid, best_ask)
+        # Use weighted mid if orderbook available, otherwise simple mid
+        if orderbook and orderbook.get("bids") and orderbook.get("asks"):
+            mid_price = self.calculate_weighted_mid(orderbook)
+        else:
+            mid_price = self.calculate_mid_price(best_bid, best_ask)
 
         if mid_price == 0:
             return (None, None)
 
-        # Track price for volatility detection
         is_volatile = self.detect_short_term_volatility(market_id, mid_price)
 
-        # Base spread
         spread_bps = self.settings.min_spread_bps
 
-        # Apply reward adjustment (tighten if rewards subsidize)
         spread_bps = self.calculate_reward_adjusted_spread(
             market_id=market_id,
             base_spread_bps=spread_bps,
@@ -148,11 +179,9 @@ class QuoteEngine:
             breakeven_spread_bps=breakeven_spread_bps,
         )
 
-        # Widen spread during volatility instead of pulling quotes (uptime strategy)
         if is_volatile or widen_for_uptime:
             spread_bps = int(spread_bps * self.settings.wide_spread_multiplier)
 
-        # Apply adverse selection guard multiplier (event timing, momentum, fill patterns)
         if as_spread_multiplier > 1.0:
             spread_bps = int(spread_bps * as_spread_multiplier)
             logger.info(
@@ -166,9 +195,8 @@ class QuoteEngine:
         bid_price = self.calculate_bid_price(mid_price, spread_bps)
         ask_price = self.calculate_ask_price(mid_price, spread_bps)
 
-        # Size: use allocated capital if available, else default
         if allocated_capital > 0:
-            base_size = min(allocated_capital * 0.1, self.settings.default_size)  # 10% per quote
+            base_size = min(allocated_capital * 0.1, self.settings.default_size)
         else:
             base_size = self.settings.default_size
 
