@@ -27,80 +27,107 @@ class TestQuoteEngineBasics:
         assert engine.calculate_mid_price(0.0, 0.55) == 0.0
         assert engine.calculate_mid_price(0.45, 0.0) == 0.0
 
-    def test_bid_ask_prices(self, engine: QuoteEngine):
-        bid = engine.calculate_bid_price(0.50, 10)
-        ask = engine.calculate_ask_price(0.50, 10)
-        assert bid < 0.50
-        assert ask > 0.50
-        assert bid == pytest.approx(0.4995)
-        assert ask == pytest.approx(0.5005)
-
     def test_generate_quotes_zero_mid(self, engine: QuoteEngine):
         yes, no = engine.generate_quotes("m1", 0.0, 0.0, "y", "n")
         assert yes is None
         assert no is None
 
     def test_generate_quotes_basic(self, engine: QuoteEngine):
+        """Quotes should be below mid and within reward spread."""
         yes, no = engine.generate_quotes(
-            "m1", 0.45, 0.55, "yes_token", "no_token"
+            "m1", 0.45, 0.55, "yes_token", "no_token",
+            max_reward_spread_bps=450,  # ±4.5 cents from mid
         )
         assert yes is not None
         assert no is not None
         assert yes.side == "BUY"
         assert yes.token_id == "yes_token"
         assert no.token_id == "no_token"
-        assert yes.price < 0.50  # bid below mid
-        assert yes.size > 0
+        # Bid below mid (0.50) but within ±4.5 cents (≥ 0.455)
+        assert yes.price < 0.50
+        assert yes.price >= 0.455
+        assert yes.size == 5.0
 
-    def test_generate_quotes_with_allocated_capital(self, engine: QuoteEngine):
-        """Allocated capital should cap quote size to 10% of capital."""
+    def test_quotes_within_reward_spread(self, engine: QuoteEngine):
+        """Quotes MUST be within ±max_spread of midpoint to earn rewards."""
         yes, no = engine.generate_quotes(
-            "m1", 0.45, 0.55, "y", "n", allocated_capital=500.0
+            "m1", 0.48, 0.52, "y", "n",
+            max_reward_spread_bps=400,  # ±4 cents from mid
         )
         assert yes is not None
-        # 10% of 500 = 50, less than default_size 100
-        assert yes.size <= 50.0
+        mid = 0.50
+        max_half = 400 / 10000  # 0.04
+        distance = mid - yes.price
+        assert distance <= max_half  # MUST be within reward spread
 
-
-class TestRewardAdjustedSpread:
-    def test_no_reward_returns_base(self, engine: QuoteEngine):
-        spread = engine.calculate_reward_adjusted_spread("m1", 10, reward_rate_daily=0.0)
-        assert spread == 10
-
-    def test_reward_disabled_returns_base(self, engine: QuoteEngine):
-        engine.settings.reward_adjusted_spreads = False
-        spread = engine.calculate_reward_adjusted_spread("m1", 10, reward_rate_daily=100.0)
-        assert spread == 10
-
-    def test_reward_tightens_spread(self, engine: QuoteEngine):
-        """High reward rate should tighten the spread."""
-        base = 50
-        spread = engine.calculate_reward_adjusted_spread(
-            "m1", base, reward_rate_daily=500.0, volume_24h=100000.0
+    def test_quotes_use_minimum_size(self, engine: QuoteEngine):
+        """All quotes should use minimum size to minimize risk."""
+        yes, no = engine.generate_quotes(
+            "m1", 0.45, 0.55, "y", "n",
+            allocated_capital=10000.0,
+            max_reward_spread_bps=450,
         )
-        assert spread < base
+        assert yes is not None
+        assert yes.size == 5.0  # Always minimum, regardless of capital
 
-    def test_reward_respects_floor(self, engine: QuoteEngine):
-        """Spread should never go below min_spread_bps."""
-        spread = engine.calculate_reward_adjusted_spread(
-            "m1", 10, reward_rate_daily=999999.0, volume_24h=100000.0
+    def test_quotes_respect_min_shares(self, engine: QuoteEngine):
+        """Quote size should use the reward program's minimum shares."""
+        yes, no = engine.generate_quotes(
+            "m1", 0.45, 0.55, "y", "n",
+            max_reward_spread_bps=450,
+            min_shares=50.0,
         )
-        assert spread >= engine.settings.min_spread_bps
+        assert yes is not None
+        assert yes.size == 50.0
 
-    def test_reward_respects_breakeven(self, engine: QuoteEngine):
-        """Spread should not go below breakeven."""
-        spread = engine.calculate_reward_adjusted_spread(
-            "m1", 50, reward_rate_daily=500.0, volume_24h=100000.0,
-            breakeven_spread_bps=30.0,
+    def test_quotes_at_target_spread(self, engine: QuoteEngine):
+        """Quotes should target ~75% of max spread from mid."""
+        yes, no = engine.generate_quotes(
+            "m1", 0.49, 0.51, "y", "n",
+            max_reward_spread_bps=400,  # ±4 cents
         )
-        assert spread >= 30
+        assert yes is not None
+        mid = 0.50
+        distance = mid - yes.price
+        max_half = 400 / 10000  # 0.04
+        # Should be between 50% and 90% of max spread
+        assert distance >= max_half * 0.5
+        assert distance <= max_half * 0.95
 
-    def test_moderate_reward(self, engine: QuoteEngine):
-        """Moderate reward should partially tighten."""
-        spread = engine.calculate_reward_adjusted_spread(
-            "m1", 100, reward_rate_daily=50.0, volume_24h=50000.0
+    def test_no_quotes_when_price_invalid(self, engine: QuoteEngine):
+        """If price would be invalid (< 0.01), no quote generated."""
+        yes, no = engine.generate_quotes(
+            "m1", 0.01, 0.03, "y", "n",
+            max_reward_spread_bps=500,
         )
-        assert engine.settings.min_spread_bps <= spread <= 100
+        assert yes is None  # Price would be below 0.01
+
+    def test_both_sides_generated(self, engine: QuoteEngine):
+        """Both YES and NO quotes needed for full reward scoring."""
+        yes, no = engine.generate_quotes(
+            "m1", 0.45, 0.55, "y", "n",
+            max_reward_spread_bps=450,
+        )
+        assert yes is not None
+        assert no is not None
+        # Both should be BUY orders
+        assert yes.side == "BUY"
+        assert no.side == "BUY"
+
+    def test_asymmetric_market(self, engine: QuoteEngine):
+        """Test market with mid far from 0.50 (e.g. 10% probability)."""
+        yes, no = engine.generate_quotes(
+            "m1", 0.09, 0.11, "y", "n",
+            max_reward_spread_bps=400,  # ±4 cents
+        )
+        # YES bid should be near 0.10 mid, within ±4 cents
+        assert yes is not None
+        assert yes.price >= 0.06  # min = 0.10 - 0.04 = 0.06
+        assert yes.price <= 0.10
+        # NO bid should be near 0.90 mid, within ±4 cents
+        assert no is not None
+        assert no.price >= 0.86  # min = 0.90 - 0.04 = 0.86
+        assert no.price <= 0.90
 
 
 class TestVolatilityDetection:
@@ -114,10 +141,8 @@ class TestVolatilityDetection:
         assert result is False
 
     def test_wild_prices_volatile(self, engine: QuoteEngine):
-        # Build history
         for _ in range(10):
             engine.detect_short_term_volatility("m1", 0.50)
-        # Big move
         result = engine.detect_short_term_volatility("m1", 0.60)
         assert result is True
 
@@ -127,31 +152,16 @@ class TestVolatilityDetection:
         assert len(engine._last_mid_prices["m1"]) == 20
 
 
-class TestWidenForUptime:
-    def test_widen_multiplies_spread(self, engine: QuoteEngine):
-        """Widening for uptime should multiply spread."""
-        yes_normal, _ = engine.generate_quotes("m1", 0.45, 0.55, "y", "n")
-        yes_wide, _ = engine.generate_quotes(
-            "m1", 0.45, 0.55, "y", "n", widen_for_uptime=True
-        )
-        assert yes_normal is not None
-        assert yes_wide is not None
-        # Wide quote should have lower bid (wider spread)
-        assert yes_wide.price < yes_normal.price
-
-
-class TestInventorySkew:
-    def test_adjust_for_inventory_skew_neutral(self, engine: QuoteEngine):
-        size = engine.adjust_for_inventory_skew(100.0, 0.5, "BUY")
-        assert size == 100.0
-
-    def test_adjust_for_inventory_skew_long(self, engine: QuoteEngine):
-        engine.inventory_manager.inventory.net_exposure_usd = 5000
-        engine.inventory_manager.inventory.total_value_usd = 6000
-        engine.inventory_manager.inventory.yes_position = 100
-        size = engine.adjust_for_inventory_skew(100.0, 0.5, "BUY")
-        assert size == 50.0  # Reduced because long + buying
-
+class TestSafety:
     def test_should_trim_quotes(self, engine: QuoteEngine):
         assert engine.should_trim_quotes(0.5) is True
         assert engine.should_trim_quotes(2.0) is False
+
+    def test_fallback_spread_without_reward(self, engine: QuoteEngine):
+        """Without max_reward_spread, should use conservative fallback below best bid."""
+        yes, no = engine.generate_quotes(
+            "m1", 0.45, 0.55, "y", "n",
+            max_reward_spread_bps=0,
+        )
+        assert yes is not None
+        assert yes.price < 0.45  # Fallback mode stays below best bid

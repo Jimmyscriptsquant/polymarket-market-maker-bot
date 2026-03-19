@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     max_exposure_usd: float = Field(default=10000.0, description="Maximum net exposure in USD")
     min_exposure_usd: float = Field(default=-10000.0, description="Minimum net exposure in USD")
     target_inventory_balance: float = Field(default=0.0, description="Target inventory balance")
-    inventory_skew_limit: float = Field(default=0.3, description="Maximum inventory skew (0-1)")
+    inventory_skew_limit: float = Field(default=1.0, description="Maximum inventory skew (0-1), 1.0=disabled for reward farming")
     
     # Cancel/replace logic
     cancel_replace_interval_ms: int = Field(default=500, description="Cancel/replace cycle interval (ms)")

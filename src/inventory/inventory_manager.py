@@ -165,8 +165,10 @@ class InventoryManager:
         Fetches USDC balance and open positions to avoid starting from zero.
         """
         try:
-            # Get USDC balance
-            balance_data = await rest_client.get_balance_allowance(asset_type="COLLATERAL")
+            # Get USDC balance (signature_type=2 for Polymarket proxy/Gnosis Safe)
+            balance_data = await rest_client.get_balance_allowance(
+                asset_type="COLLATERAL", signature_type="2"
+            )
             usdc_balance = float(balance_data.get("balance", 0)) / 1e6  # 6 decimals
             self.pnl.session_start_balance = usdc_balance
 

@@ -28,8 +28,8 @@ class TestRewardClient:
             "condition_id": "0xabc",
             "question": "Will X happen?",
             "rewards_daily_rate": 150.0,
-            "max_spread": 200,
-            "min_size": 100,
+            "rewards_max_spread": 2.0,
+            "rewards_min_size": 100,
             "num_lps": 5,
             "competition_score": 2.5,
             "volume_24h": 50000,
@@ -92,11 +92,12 @@ class TestRewardClient:
 
     @pytest.mark.asyncio
     async def test_fetch_reward_markets_dict_response(self, client: RewardClient):
-        """API returns {"markets": [...]}."""
+        """API returns paginated {"data": [...], "next_cursor": ""}."""
         mock_resp = _mock_response({
-            "markets": [
-                {"id": "m1", "rewards_daily_rate": 5.0, "tokens": []},
-            ]
+            "data": [
+                {"condition_id": "m1", "rewards_daily_rate": 5.0, "tokens": []},
+            ],
+            "next_cursor": "",
         })
         client.client.get = AsyncMock(return_value=mock_resp)
 

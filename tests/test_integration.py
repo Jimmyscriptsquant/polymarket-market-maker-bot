@@ -137,19 +137,15 @@ class TestMarketMakerBotIntegration:
         assert bot.order_executor.place_order.call_count == 0
 
     @pytest.mark.asyncio
-    async def test_cancel_stale_orders(self, bot: MarketMakerBot):
-        import time
-        stale_order = {
-            "id": "old_order",
-            "created_at": str(time.time() - 10),  # 10s old
-        }
-        bot.rest_client.get_open_orders = AsyncMock(return_value=[stale_order])
+    async def test_cancel_all_market_orders(self, bot: MarketMakerBot):
+        open_order = {"id": "order123"}
+        bot.rest_client.get_open_orders = AsyncMock(return_value=[open_order])
 
-        await bot._cancel_stale_orders("test_market")
+        await bot._cancel_all_market_orders("test_market")
 
         bot.order_executor.batch_cancel_orders.assert_called_once()
         args = bot.order_executor.batch_cancel_orders.call_args[0][0]
-        assert "old_order" in args
+        assert "order123" in args
 
     @pytest.mark.asyncio
     async def test_place_quote_risk_rejection(self, bot: MarketMakerBot):

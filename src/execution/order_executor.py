@@ -1,8 +1,10 @@
 """
-Order executor — uses OrderSigner for EIP-712 signing and PolymarketRestClient for placement.
+Order executor — uses OrderSigner (wrapping py-clob-client) for signing + placement,
+and PolymarketRestClient for cancellations and queries.
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -28,9 +30,8 @@ class OrderExecutor:
         size: float,
         side: str,
         neg_risk: bool = False,
-        fee_rate_bps: int = 0,
     ) -> dict[str, Any]:
-        """Build, sign, and place an order on the CLOB.
+        """Build, sign, and place an order via the official py-clob-client.
 
         Args:
             token_id: Outcome token ID
@@ -38,26 +39,23 @@ class OrderExecutor:
             size: Number of shares
             side: "BUY" or "SELL"
             neg_risk: Whether this is a neg-risk market
-            fee_rate_bps: Fee rate in basis points
 
         Returns:
             API response with orderID, status, etc.
         """
-        signed_order = self.order_signer.build_order(
+        # py-clob-client is synchronous — run in thread to avoid blocking the event loop
+        result = await asyncio.to_thread(
+            self.order_signer.place_order_via_client,
             token_id=token_id,
             price=price,
             size=size,
             side=side,
-            fee_rate_bps=fee_rate_bps,
             neg_risk=neg_risk,
         )
 
-        result = await self.rest_client.place_order(signed_order)
-
         logger.info(
             "order_placed",
-            order_id=result.get("orderID"),
-            status=result.get("status"),
+            order_id=result.get("orderID") if isinstance(result, dict) else str(result),
             side=side,
             price=price,
             size=size,
@@ -91,7 +89,7 @@ class OrderExecutor:
                 hedge_side=side,
                 price=price,
                 size=size,
-                order_id=result.get("orderID"),
+                order_id=result.get("orderID") if isinstance(result, dict) else str(result),
             )
             return result
 

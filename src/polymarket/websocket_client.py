@@ -128,6 +128,14 @@ class PolymarketWebSocketClient:
         while self.running:
             try:
                 message = await self.websocket.recv()
+
+                # Skip non-JSON messages (heartbeats, pings, empty frames)
+                if not message or not isinstance(message, str):
+                    continue
+                message = message.strip()
+                if not message or not message.startswith(("{", "[")):
+                    continue
+
                 data = json.loads(message)
 
                 msg_type = data.get("type") or data.get("channel") or data.get("event_type", "")
@@ -136,7 +144,6 @@ class PolymarketWebSocketClient:
                     for handler in self.message_handlers[msg_type]:
                         try:
                             result = handler(data)
-                            # Support async handlers
                             if asyncio.iscoroutine(result):
                                 await result
                         except Exception as e:
@@ -146,6 +153,9 @@ class PolymarketWebSocketClient:
                 logger.warning("websocket_connection_closed")
                 if self.running:
                     await self._reconnect()
+            except json.JSONDecodeError:
+                # Non-JSON message — skip silently
+                continue
             except Exception as e:
                 logger.error("websocket_listen_error", error=str(e))
                 if self.running:

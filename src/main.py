@@ -34,13 +34,27 @@ from src.strategy import MarketSelector, RewardClient, UptimeTracker
 logger = structlog.get_logger(__name__)
 
 
+def _best_bid_price(bids: list[dict]) -> float:
+    """Get highest bid price from orderbook bids (may not be sorted)."""
+    if not bids:
+        return 0.0
+    return max(float(b.get("price", 0)) for b in bids)
+
+
+def _best_ask_price(asks: list[dict]) -> float:
+    """Get lowest ask price from orderbook asks (may not be sorted)."""
+    if not asks:
+        return 0.0
+    return min(float(a.get("price", 0)) for a in asks)
+
+
 class MarketMakerBot:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.running = False
 
-        # Core components
-        self.order_signer = OrderSigner(settings.private_key)
+        # Core components — proxy_address is the Polymarket wallet, private_key signs for it
+        self.order_signer = OrderSigner(settings.private_key, proxy_address=settings.public_address)
         self.rest_client = PolymarketRestClient(settings, self.order_signer)
         self.ws_client = PolymarketWebSocketClient(settings)
         self.order_executor = OrderExecutor(settings, self.order_signer, self.rest_client)
@@ -78,65 +92,70 @@ class MarketMakerBot:
     # -- API Key Setup -------------------------------------------------------
 
     async def setup_api_credentials(self):
-        """Derive or create API keys for L2 auth."""
+        """Derive API keys for L2 auth using the official py-clob-client."""
         try:
-            creds = await self.rest_client.derive_api_key()
-            self.order_signer.set_api_credentials(
-                api_key=creds["apiKey"],
-                secret=creds["secret"],
-                passphrase=creds["passphrase"],
-            )
+            # py-clob-client derive_api_key is synchronous — run in thread
+            creds = await asyncio.to_thread(self.order_signer.derive_api_credentials)
             logger.info("api_credentials_derived", api_key=creds["apiKey"][:8] + "...")
-        except Exception:
-            try:
-                logger.info("deriving_api_key_failed_creating_new")
-                creds = await self.rest_client.create_api_key()
-                self.order_signer.set_api_credentials(
-                    api_key=creds["apiKey"],
-                    secret=creds["secret"],
-                    passphrase=creds["passphrase"],
-                )
-                logger.info("api_credentials_created", api_key=creds["apiKey"][:8] + "...")
-            except Exception as e:
-                logger.error("api_key_setup_failed", error=str(e))
-                raise
+        except Exception as e:
+            logger.error("api_key_setup_failed", error=str(e))
+            raise
 
     # -- Market discovery ----------------------------------------------------
 
     async def discover_market(self) -> dict[str, Any] | None:
-        if not self.settings.market_discovery_enabled:
-            return await self.rest_client.get_market_info(self.settings.market_id)
-
+        """Fallback: fetch the single configured market directly by condition_id."""
         try:
-            markets = await self.rest_client.get_markets(active=True, closed=False)
-            for market in markets:
-                if market.get("id") == self.settings.market_id:
-                    logger.info("market_discovered", market_id=market.get("id"), question=market.get("question"))
-                    return market
-
-            logger.warning("market_not_found", market_id=self.settings.market_id)
+            info = await self.rest_client.get_market_info(self.settings.market_id)
+            if info:
+                logger.info("market_discovered", market_id=self.settings.market_id)
+                return info
             return None
         except Exception as e:
             logger.error("market_discovery_failed", error=str(e))
             return None
 
     async def discover_reward_markets(self) -> list[dict[str, Any]]:
+        # Request extra candidates since some may be expired or illiquid
+        orig_count = self.settings.target_markets_count
+        self.settings.target_markets_count = orig_count * 5
         selected = await self.market_selector.scan_and_rank()
+        self.settings.target_markets_count = orig_count
+
         if not selected:
             logger.warning("no_reward_markets_selected, falling back to configured market")
             fallback = await self.discover_market()
             return [fallback] if fallback else []
 
         infos = []
+        now_ts = time.time()
         for scored in selected:
+            if len(infos) >= orig_count:
+                break
             try:
                 info = await self.rest_client.get_market_info(scored.market_id)
+
+                # Skip markets that resolve within 24 hours
+                end_date = info.get("end_date_iso") or info.get("end_date") or ""
+                if end_date:
+                    try:
+                        from datetime import datetime
+                        dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                        hours_until = (dt.timestamp() - now_ts) / 3600
+                        if hours_until < 2:
+                            logger.info("skipping_near_resolution_market", market_id=scored.market_id, end_date=end_date, hours_until=round(hours_until, 1))
+                            continue
+                    except Exception:
+                        pass
+
                 info["_reward"] = {
                     "rate_per_day": scored.info.rate_per_day,
                     "volume_24h": scored.info.volume_24h,
                     "breakeven_spread_bps": scored.breakeven_spread_bps,
                     "allocated_capital": scored.allocated_capital,
                     "reward_efficiency": scored.reward_efficiency,
+                    "max_spread_bps": scored.info.max_spread_bps,
+                    "min_shares": scored.info.min_shares,
                 }
                 mid = scored.market_id
                 self.market_infos[mid] = info
@@ -144,6 +163,16 @@ class MarketMakerBot:
 
                 # Extract token IDs and end date
                 self._extract_market_metadata(mid, info)
+
+                # Pre-fetch orderbook so we have data for quoting
+                tokens = self._token_map.get(mid, {})
+                yes_token = tokens.get("yes_token_id", "")
+                if yes_token:
+                    try:
+                        ob = await self.rest_client.get_orderbook(yes_token)
+                        self.orderbooks[mid] = ob
+                    except Exception:
+                        pass
 
                 infos.append(info)
 
@@ -162,12 +191,25 @@ class MarketMakerBot:
         tokens = info.get("tokens", [])
         token_map: dict[str, Any] = {"neg_risk": info.get("neg_risk", False)}
 
+        # Try matching by outcome name first (Yes/No)
         for token in tokens:
             outcome = token.get("outcome", "").upper()
             if outcome == "YES":
                 token_map["yes_token_id"] = token.get("token_id", "")
             elif outcome == "NO":
                 token_map["no_token_id"] = token.get("token_id", "")
+
+        # Fallback: for sports/binary markets with team names, use position
+        # First token = "YES" equivalent, second = "NO" equivalent
+        if "yes_token_id" not in token_map and len(tokens) >= 2:
+            token_map["yes_token_id"] = tokens[0].get("token_id", "")
+            token_map["no_token_id"] = tokens[1].get("token_id", "")
+            logger.debug(
+                "tokens_from_position",
+                market_id=market_id,
+                outcome_0=tokens[0].get("outcome", ""),
+                outcome_1=tokens[1].get("outcome", ""),
+            )
 
         self._token_map[market_id] = token_map
 
@@ -264,7 +306,7 @@ class MarketMakerBot:
             return
 
         # Use best ask + small buffer for likely fill
-        best_ask = float(asks[0].get("price", 0))
+        best_ask = _best_ask_price(asks)
         if hedge_side == "NO":
             best_ask = 1.0 - best_ask  # Convert for NO token
 
@@ -353,17 +395,17 @@ class MarketMakerBot:
         bids = orderbook.get("bids", [])
         asks = orderbook.get("asks", [])
 
-        if not bids or not asks:
-            self.uptime_tracker.record_tick(market_id, has_live_quotes=False)
-            return
+        best_bid = _best_bid_price(bids)
+        best_ask = _best_ask_price(asks)
 
-        best_bid = float(bids[0].get("price", 0))
-        best_ask = float(asks[0].get("price", 0))
-
-        if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
-            logger.warning("invalid_orderbook", market_id=market_id, best_bid=best_bid, best_ask=best_ask)
-            self.uptime_tracker.record_tick(market_id, has_live_quotes=False)
-            return
+        # For empty or extremely wide books (spread > 90 cents), use synthetic mid
+        # These markets have rewards precisely because they need liquidity providers
+        book_spread = (best_ask - best_bid) if (best_bid > 0 and best_ask > 0) else 1.0
+        if book_spread > 0.90 or best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
+            # Use 0.50 as default mid for binary markets with no real book
+            best_bid = 0.49
+            best_ask = 0.51
+            logger.info("using_synthetic_book", market_id=market_id, reason="empty_or_wide_book")
 
         tokens = self._token_map.get(market_id, {})
         yes_token_id = tokens.get("yes_token_id", "")
@@ -398,6 +440,9 @@ class MarketMakerBot:
             as_state.spread_multiplier,
         )
 
+        max_reward_spread = reward_data.get("max_spread_bps", 0.0)
+        min_shares = reward_data.get("min_shares", 50.0)
+
         yes_quote, no_quote = self.quote_engine.generate_quotes(
             market_id=market_id,
             best_bid=best_bid,
@@ -411,9 +456,12 @@ class MarketMakerBot:
             widen_for_uptime=widen,
             as_spread_multiplier=as_mult,
             orderbook=orderbook,
+            max_reward_spread_bps=max_reward_spread,
+            min_shares=min_shares,
         )
 
-        await self._cancel_stale_orders(market_id)
+        # CANCEL first, THEN place — never stack orders
+        await self._cancel_all_market_orders(market_id)
 
         quotes_placed = False
         if yes_quote:
@@ -425,24 +473,22 @@ class MarketMakerBot:
 
         self.uptime_tracker.record_tick(market_id, has_live_quotes=quotes_placed)
 
-    async def _cancel_stale_orders(self, market_id: str):
+    async def _cancel_all_market_orders(self, market_id: str):
+        """Cancel ALL open orders for a market before placing new ones.
+
+        This prevents order stacking — the #1 cause of unintended fills.
+        """
         try:
             open_orders = await self.rest_client.get_open_orders(market=market_id)
+            if not open_orders:
+                return
 
-            current_time = time.time() * 1000
-            order_ids_to_cancel = []
-
-            for order in open_orders:
-                order_time = float(order.get("created_at", 0)) * 1000
-                age = current_time - order_time
-
-                if age > self.settings.order_lifetime_ms:
-                    order_ids_to_cancel.append(order.get("id"))
-
-            if order_ids_to_cancel:
-                await self.order_executor.batch_cancel_orders(order_ids_to_cancel)
+            order_ids = [o.get("id") for o in open_orders if o.get("id")]
+            if order_ids:
+                await self.order_executor.batch_cancel_orders(order_ids)
+                logger.info("orders_cancelled_before_refresh", market_id=market_id, count=len(order_ids))
         except Exception as e:
-            logger.error("stale_order_cancellation_failed", market_id=market_id, error=str(e))
+            logger.error("cancel_before_refresh_failed", market_id=market_id, error=str(e))
 
     async def _place_quote(self, quote: Any, outcome: str):
         is_valid, reason = self.risk_manager.validate_order(quote.side, quote.size * quote.price)
@@ -579,6 +625,13 @@ class MarketMakerBot:
             mid = self.settings.market_id
             self.uptime_tracker.register_market(mid)
             self._extract_market_metadata(mid, single)
+
+        # Phase 1.5: Cancel ALL stale orders from previous runs
+        for info in market_infos:
+            mid = info.get("id") or info.get("condition_id", "")
+            if mid:
+                await self._cancel_all_market_orders(mid)
+        logger.info("stale_orders_cancelled", markets=len(market_infos))
 
         # Phase 2: Initialize orderbooks
         for info in market_infos:

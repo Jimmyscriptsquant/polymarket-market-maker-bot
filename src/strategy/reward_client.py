@@ -42,17 +42,42 @@ class RewardClient:
     async def fetch_reward_markets(self) -> list[MarketRewardInfo]:
         """Fetch all markets with active reward programs."""
         try:
-            response = await self.client.get(
-                f"{self.rewards_url}/markets",
-                params={"active": "true"},
-            )
-            response.raise_for_status()
-            data = response.json()
+            all_items: list[dict] = []
+            next_cursor = ""
+
+            # Paginate through all reward markets
+            while True:
+                params: dict[str, str] = {"limit": "500"}
+                if next_cursor:
+                    params["next_cursor"] = next_cursor
+
+                response = await self.client.get(
+                    f"{self.rewards_url}/markets/current",
+                    params=params,
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                if isinstance(data, list):
+                    all_items.extend(data)
+                    break
+                elif isinstance(data, dict):
+                    items = data.get("data", [])
+                    all_items.extend(items)
+                    next_cursor = data.get("next_cursor", "")
+                    if not next_cursor or next_cursor == "LTE=" or not items:
+                        break
+                else:
+                    break
 
             markets = []
-            for item in data if isinstance(data, list) else data.get("markets", []):
+            max_affordable_shares = self.settings.capital_pool_usd / self.settings.target_markets_count / 0.50
+            for item in all_items:
                 info = self._parse_reward_market(item)
                 if info and info.rate_per_day >= self.settings.min_reward_rate_daily:
+                    # Filter out markets we can't afford the minimum shares for
+                    if info.min_shares > max_affordable_shares:
+                        continue
                     markets.append(info)
 
             logger.info("reward_markets_fetched", count=len(markets))
@@ -87,22 +112,42 @@ class RewardClient:
             return {}
 
     def _parse_reward_market(self, raw: dict[str, Any]) -> MarketRewardInfo | None:
-        """Parse raw API response into MarketRewardInfo."""
+        """Parse raw API response into MarketRewardInfo.
+
+        Handles both /rewards/markets/current format:
+            {condition_id, rewards_config: [{rate_per_day, ...}], rewards_max_spread, rewards_min_size, total_daily_rate}
+        And enriched market format with tokens/question.
+        """
         try:
             market_id = raw.get("condition_id") or raw.get("market_id") or raw.get("id", "")
             if not market_id:
                 return None
 
+            # Parse rate from rewards_config or direct fields
+            rate = float(raw.get("total_daily_rate", 0) or raw.get("native_daily_rate", 0))
+            if rate == 0:
+                configs = raw.get("rewards_config", [])
+                if configs:
+                    rate = float(configs[0].get("rate_per_day", 0))
+            if rate == 0:
+                rate = float(raw.get("rewards_daily_rate", 0) or raw.get("rate_per_day", 0))
+
+            # Max spread: rewards_max_spread is in cents (e.g. 4.5 = 4.5 cents = 450 bps)
+            max_spread_cents = float(raw.get("rewards_max_spread", 0) or 0)
+            max_spread_bps = max_spread_cents * 100 if max_spread_cents > 0 else 350.0
+
+            min_size = float(raw.get("rewards_min_size", 50) or 50)
+
             tokens = raw.get("tokens", [])
-            yes_token = next((t for t in tokens if t.get("outcome") == "Yes"), {})
-            no_token = next((t for t in tokens if t.get("outcome") == "No"), {})
+            yes_token = next((t for t in tokens if t.get("outcome", "").upper() == "YES"), {})
+            no_token = next((t for t in tokens if t.get("outcome", "").upper() == "NO"), {})
 
             return MarketRewardInfo(
                 market_id=market_id,
                 question=raw.get("question", ""),
-                rate_per_day=float(raw.get("rewards_daily_rate", 0) or raw.get("rate_per_day", 0)),
-                max_spread_bps=float(raw.get("max_spread", 350) or 350),
-                min_shares=float(raw.get("min_size", 50) or 50),
+                rate_per_day=rate,
+                max_spread_bps=max_spread_bps,
+                min_shares=min_size,
                 num_lps=int(raw.get("num_lps", 0) or 0),
                 competition_score=float(raw.get("competition_score", 1.0) or 1.0),
                 yes_token_id=yes_token.get("token_id", ""),

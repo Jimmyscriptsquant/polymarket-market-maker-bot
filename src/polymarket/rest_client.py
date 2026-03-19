@@ -197,10 +197,10 @@ class PolymarketRestClient:
         return result
 
     async def get_balance_allowance(
-        self, asset_type: str = "COLLATERAL", token_id: str = ""
+        self, asset_type: str = "COLLATERAL", token_id: str = "", signature_type: str = "2"
     ) -> dict[str, Any]:
         """Get balance and allowance for USDC or outcome tokens."""
-        params: dict[str, str] = {"asset_type": asset_type}
+        params: dict[str, str] = {"asset_type": asset_type, "signature_type": signature_type}
         if token_id:
             params["token_id"] = token_id
         return await self._request("GET", "/balance-allowance", params=params, auth=True)
