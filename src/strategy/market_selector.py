@@ -81,7 +81,15 @@ class MarketSelector:
                 continue
 
             # Fetch orderbook to measure actual competition depth
-            book_depth = await self._get_book_depth(market.market_id)
+            # CLOB /book requires token_id — fetch market info if we don't have it
+            token_id = market.yes_token_id
+            if not token_id:
+                token_id = await self._fetch_yes_token_id(market.market_id)
+                if token_id:
+                    market.yes_token_id = token_id
+            if not token_id:
+                continue
+            book_depth = await self._get_book_depth(token_id)
 
             # Competition: use orderbook depth as primary signal (more reliable than API score)
             # Low depth = low competition = we capture bigger share of reward pool
@@ -152,14 +160,33 @@ class MarketSelector:
             share = market.reward_efficiency / total_efficiency
             market.allocated_capital = round(pool * share, 2)
 
-    async def _get_book_depth(self, market_id: str) -> float:
+    async def _fetch_yes_token_id(self, market_id: str) -> str:
+        """Fetch market info to get the YES token_id (rewards API doesn't include tokens)."""
+        try:
+            response = await self.reward_client.client.get(
+                f"{self.reward_client.base_url}/markets/{market_id}"
+            )
+            response.raise_for_status()
+            data = response.json()
+            tokens = data.get("tokens", [])
+            # Try YES outcome first, fall back to first token
+            for t in tokens:
+                if t.get("outcome", "").upper() == "YES":
+                    return t.get("token_id", "")
+            if tokens:
+                return tokens[0].get("token_id", "")
+        except Exception:
+            pass
+        return ""
+
+    async def _get_book_depth(self, token_id: str) -> float:
         """Fetch orderbook and return total resting size (bid + ask depth).
 
         This is the best proxy for competition — markets with thin books
         mean fewer LPs competing for the reward pool.
         """
         try:
-            book = await self.reward_client.fetch_orderbook_snapshot(market_id)
+            book = await self.reward_client.fetch_orderbook_snapshot(token_id)
             bids = book.get("bids", [])
             asks = book.get("asks", [])
             bid_depth = sum(float(b.get("size", 0)) for b in bids)

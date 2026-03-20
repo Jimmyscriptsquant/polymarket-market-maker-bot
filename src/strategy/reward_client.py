@@ -101,16 +101,16 @@ class RewardClient:
             logger.warning("competition_fetch_failed", market_id=market_id, error=str(e))
             return {}
 
-    async def fetch_orderbook_snapshot(self, market_id: str) -> dict[str, Any]:
-        """Fetch current orderbook for volatility/spread estimation."""
+    async def fetch_orderbook_snapshot(self, token_id: str) -> dict[str, Any]:
+        """Fetch current orderbook by token_id (CLOB /book requires token_id, not market)."""
         try:
             response = await self.client.get(
-                f"{self.base_url}/book", params={"market": market_id}
+                f"{self.base_url}/book", params={"token_id": token_id}
             )
             response.raise_for_status()
             return response.json()
         except Exception as e:
-            logger.warning("orderbook_snapshot_failed", market_id=market_id, error=str(e))
+            logger.warning("orderbook_snapshot_failed", token_id=token_id[:16], error=str(e))
             return {}
 
     def _parse_reward_market(self, raw: dict[str, Any]) -> MarketRewardInfo | None:
