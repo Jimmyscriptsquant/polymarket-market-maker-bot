@@ -53,14 +53,26 @@ class MarketSelector:
         return elapsed >= self.settings.market_rotation_interval_s
 
     async def scan_and_rank(self) -> list[ScoredMarket]:
-        """Fetch all reward markets, score them, and select top N."""
+        """Fetch all reward markets, score them, and select top N.
+
+        Ranking formula prioritizes:
+        1. Low competition (orderbook depth) — we capture a bigger share of the pool
+        2. High reward rate — bigger pool to share
+        3. Wide max spread — easier to stay in range, less fill risk
+        4. Avoid extreme midpoints (<0.10 or >0.90) — two-sided is harder there
+        """
         reward_markets = await self.reward_client.fetch_reward_markets()
         if not reward_markets:
             logger.warning("no_reward_markets_found")
             return self._selected_markets
 
+        # Pre-filter: sort by rate and only check book depth for top candidates
+        # This avoids hundreds of API calls for markets we'd never select
+        reward_markets.sort(key=lambda m: m.rate_per_day, reverse=True)
+        candidates = reward_markets[:self.settings.target_markets_count * 8]
+
         scored: list[ScoredMarket] = []
-        for market in reward_markets:
+        for market in candidates:
             vol = self._estimate_volatility(market.market_id)
 
             # Skip markets above volatility threshold
@@ -68,16 +80,32 @@ class MarketSelector:
                 logger.debug("market_too_volatile", market_id=market.market_id, vol=vol)
                 continue
 
-            # Avoid division by zero — floor competition and vol
-            comp = max(market.competition_score, 0.1)
+            # Fetch orderbook to measure actual competition depth
+            book_depth = await self._get_book_depth(market.market_id)
+
+            # Competition: use orderbook depth as primary signal (more reliable than API score)
+            # Low depth = low competition = we capture bigger share of reward pool
+            # Floor at 10 to avoid division by zero
+            comp = max(book_depth, 10.0)
+
             vol_adj = max(vol, 0.01)
 
+            # Core efficiency: reward rate / competition depth
+            # Higher = more reward per unit of competition we face
             efficiency = market.rate_per_day / (comp * vol_adj)
+
+            # Bonus for wider max spread (easier to stay in range)
+            spread_bonus = market.max_spread_bps / 450.0  # normalize: 450bps = 1.0
+            efficiency *= spread_bonus
+
+            # Penalty for extreme midpoints (harder to quote both sides profitably)
+            mid = (market.best_bid + market.best_ask) / 2.0 if market.best_bid > 0 and market.best_ask < 1.0 else 0.5
+            if mid < 0.10 or mid > 0.90:
+                efficiency *= 0.3  # heavy penalty — two-sided is mandatory and risky
 
             # Estimate breakeven spread accounting for reward subsidy
             expected_daily_fills = max(market.volume_24h / 100.0, 1.0)
             reward_per_fill = market.rate_per_day / expected_daily_fills
-            # Adverse selection cost estimate: volatility * 100 bps
             adverse_selection_bps = vol_adj * 10000
             breakeven = max(adverse_selection_bps - (reward_per_fill * 10000), 1.0)
 
@@ -123,6 +151,22 @@ class MarketSelector:
         for market in markets:
             share = market.reward_efficiency / total_efficiency
             market.allocated_capital = round(pool * share, 2)
+
+    async def _get_book_depth(self, market_id: str) -> float:
+        """Fetch orderbook and return total resting size (bid + ask depth).
+
+        This is the best proxy for competition — markets with thin books
+        mean fewer LPs competing for the reward pool.
+        """
+        try:
+            book = await self.reward_client.fetch_orderbook_snapshot(market_id)
+            bids = book.get("bids", [])
+            asks = book.get("asks", [])
+            bid_depth = sum(float(b.get("size", 0)) for b in bids)
+            ask_depth = sum(float(a.get("size", 0)) for a in asks)
+            return bid_depth + ask_depth
+        except Exception:
+            return 1000.0  # Conservative default if fetch fails
 
     def record_price(self, market_id: str, mid_price: float) -> None:
         """Record a price observation for volatility estimation."""

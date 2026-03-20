@@ -17,10 +17,11 @@ MIN_ORDER_SIZE = 5.0
 
 # Target spread as fraction of max reward spread (±v from mid).
 # The scoring formula is S = ((v-s)/v)^2 * b, which is quadratic.
-# At 0.75v: score = 0.0625 (6.25% of max) — low fill risk, some reward.
-# At 0.50v: score = 0.25 (25% of max) — moderate fill risk, decent reward.
-# We target 0.75 as a balance between fill safety and reward earning.
-REWARD_SPREAD_FRACTION = 0.75
+# At 0.75v: score = 0.0625 (6.25% of max) — low fill risk, tiny reward.
+# At 0.50v: score = 0.25 (25% of max) — moderate fill risk, 4x more reward.
+# At 0.25v: score = 0.5625 (56% of max) — high fill risk, 9x more reward.
+# We target 0.50 for the best risk/reward tradeoff with small capital.
+REWARD_SPREAD_FRACTION = 0.50
 
 
 @dataclass
@@ -105,13 +106,42 @@ class QuoteEngine:
         if mid_price <= 0:
             return (None, None)
 
+        # Adverse selection protection: if multiplier is high, pull quotes entirely.
+        # We can't widen beyond the reward spread (that would lose eligibility),
+        # so the safe response to informed flow is to stop quoting temporarily.
+        # Multiplier > 1.5 = moderate risk (momentum or one-sided fills detected)
+        # Multiplier > 2.5 = high risk (strong signal, pull immediately)
+        if as_spread_multiplier > 2.5:
+            logger.warning(
+                "as_guard_pulling_quotes",
+                market_id=market_id,
+                multiplier=round(as_spread_multiplier, 2),
+                reason="high_adverse_selection_risk",
+            )
+            return (None, None)
+
         # max_reward_spread_bps is ±v from midpoint (e.g. 400 = ±4 cents = 0.04)
         # This IS the half-spread directly — NOT the full bid-ask width
         if max_reward_spread_bps > 0:
             max_half_spread = max_reward_spread_bps / 10000  # e.g. 400 → 0.04
-            # Target = 75% of max spread from mid (balance fill safety vs score)
-            # Score at 75%: ((1-0.75)/1)^2 = 6.25% of max
-            target_half_spread = max_half_spread * REWARD_SPREAD_FRACTION
+
+            # Under moderate AS risk (1.5-2.5x), widen toward edge of reward range.
+            # This reduces score but also reduces fill probability.
+            # Normal: 50% of max. Under AS stress: scale toward 90% of max.
+            if as_spread_multiplier > 1.5:
+                # Interpolate: at 1.5x → 50%, at 2.5x → 90%
+                stress = min((as_spread_multiplier - 1.5) / 1.0, 1.0)  # 0.0 to 1.0
+                spread_frac = REWARD_SPREAD_FRACTION + stress * (0.90 - REWARD_SPREAD_FRACTION)
+                logger.info(
+                    "as_widening_within_reward",
+                    market_id=market_id,
+                    multiplier=round(as_spread_multiplier, 2),
+                    spread_frac=round(spread_frac, 3),
+                )
+            else:
+                spread_frac = REWARD_SPREAD_FRACTION
+
+            target_half_spread = max_half_spread * spread_frac
         else:
             max_half_spread = 0.0
             target_half_spread = self.settings.min_spread_bps * 3 / 10000
@@ -145,6 +175,20 @@ class QuoteEngine:
         if no_bid_price < 0.01 or no_bid_price > 0.99:
             no_bid_price = 0.0
 
+        # Rule 4: Extreme midpoint two-sided requirement
+        # If mid < 0.10 or mid > 0.90, BOTH sides must be quotable or we earn nothing.
+        # Single-sided orders score 0 in extreme ranges (not just 1/3).
+        is_extreme = mid_price < 0.10 or mid_price > 0.90
+        if is_extreme and (yes_bid_price <= 0 or no_bid_price <= 0):
+            logger.warning(
+                "extreme_mid_requires_two_sided",
+                market_id=market_id,
+                mid=round(mid_price, 4),
+                yes_bid=yes_bid_price,
+                no_bid=no_bid_price,
+            )
+            return (None, None)
+
         # Use the reward program's minimum shares requirement
         quote_size = max(min_shares, MIN_ORDER_SIZE) if min_shares > 0 else MIN_ORDER_SIZE
 
@@ -158,6 +202,8 @@ class QuoteEngine:
             max_spread=round(max_half_spread, 4),
             best_bid=best_bid,
             best_ask=best_ask,
+            two_sided=(yes_bid_price > 0 and no_bid_price > 0),
+            extreme_mid=is_extreme,
         )
 
         yes_quote = None

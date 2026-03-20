@@ -283,6 +283,15 @@ class MarketMakerBot:
         if hedge:
             asyncio.create_task(self._execute_hedge(market_id, hedge))
 
+        # EMERGENCY REQUOTE: Fill means someone took our order — immediately
+        # cancel remaining orders and requote with updated AS state.
+        # This prevents stale quotes from getting picked off during fast moves.
+        market_info = self.market_infos.get(market_id)
+        if market_info:
+            # Reset the quote timer so refresh_quotes_for_market runs immediately
+            self.last_quote_times[market_id] = 0
+            asyncio.create_task(self._emergency_requote(market_id, market_info))
+
     async def _execute_hedge(self, market_id: str, hedge: dict[str, Any]):
         """Execute a hedge order from the AS guard."""
         hedge_side = hedge["side"]  # "YES" or "NO"
@@ -460,8 +469,17 @@ class MarketMakerBot:
             min_shares=min_shares,
         )
 
-        # CANCEL first, THEN place — never stack orders
-        await self._cancel_all_market_orders(market_id)
+        # PLACE-THEN-CANCEL: Place new orders first, then cancel old ones.
+        # This minimizes the gap where no orders are on the book (Rule 5).
+        # Brief overlap of old+new orders is safer than a gap with zero orders,
+        # since reward sampling requires orders to be resting on the book.
+        # Capture existing order IDs before placing new ones.
+        old_order_ids: list[str] = []
+        try:
+            open_orders = await self.rest_client.get_open_orders(market=market_id)
+            old_order_ids = [o.get("id") for o in (open_orders or []) if o.get("id")]
+        except Exception:
+            pass
 
         quotes_placed = False
         if yes_quote:
@@ -471,7 +489,33 @@ class MarketMakerBot:
             await self._place_quote(no_quote, "NO")
             quotes_placed = True
 
+        # Now cancel the OLD orders (new ones are already resting)
+        if old_order_ids:
+            try:
+                await self.order_executor.batch_cancel_orders(old_order_ids)
+                logger.info("old_orders_cancelled", market_id=market_id, count=len(old_order_ids))
+            except Exception as e:
+                logger.error("old_order_cancel_failed", market_id=market_id, error=str(e))
+
         self.uptime_tracker.record_tick(market_id, has_live_quotes=quotes_placed)
+
+    async def _emergency_requote(self, market_id: str, market_info: dict[str, Any]):
+        """Emergency requote after a fill — cancel all orders and refresh immediately.
+
+        This runs outside the normal 60s cycle. When we get filled, our remaining
+        orders may be stale (wrong price given the new information). Cancel
+        everything and requote with fresh AS guard state.
+        """
+        try:
+            logger.info("emergency_requote", market_id=market_id)
+            # Cancel all existing orders immediately
+            await self._cancel_all_market_orders(market_id)
+            # Update orderbook before requoting
+            await self.update_orderbook(market_id)
+            # Requote with fresh state (AS guard multiplier is now updated)
+            await self.refresh_quotes_for_market(market_id, market_info)
+        except Exception as e:
+            logger.error("emergency_requote_failed", market_id=market_id, error=str(e))
 
     async def _cancel_all_market_orders(self, market_id: str):
         """Cancel ALL open orders for a market before placing new ones.

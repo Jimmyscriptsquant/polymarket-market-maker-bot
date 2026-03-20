@@ -165,3 +165,32 @@ class TestSafety:
         )
         assert yes is not None
         assert yes.price < 0.45  # Fallback mode stays below best bid
+
+    def test_extreme_mid_requires_two_sided(self, engine: QuoteEngine):
+        """Rule 4: mid < 0.10 or > 0.90 requires both YES and NO quotes or returns nothing."""
+        # Mid ~0.05 — YES bid would be ~0.01 (barely valid), NO bid ~0.92 (valid)
+        # But if YES side can't produce valid price, both should be None
+        yes, no = engine.generate_quotes(
+            "m1", 0.04, 0.06, "y", "n",
+            max_reward_spread_bps=100,  # ±1¢ — very tight around 0.05 mid
+        )
+        # With ±1¢ around mid=0.05: YES bid floor = 0.05-0.01+0.005 = 0.045
+        # NO bid = (1-0.05) - 0.0075 = 0.9425, ceil → 0.95 — valid
+        # YES bid = 0.05 - 0.0075 = 0.0425, ceil → 0.05 — valid
+        # Both should be valid, so quotes returned
+        if yes is None:
+            # If YES side couldn't produce valid price, NO must also be None
+            assert no is None
+
+    def test_extreme_mid_high_requires_two_sided(self, engine: QuoteEngine):
+        """Rule 4: mid > 0.90 with one side invalid → no quotes."""
+        # Mid = 0.96 — NO side price = (1-0.96) - spread = 0.04 - spread
+        # With tiny max spread, NO side might be valid but YES side very high
+        yes, no = engine.generate_quotes(
+            "m1", 0.95, 0.97, "y", "n",
+            max_reward_spread_bps=100,  # ±1¢
+        )
+        if yes is None:
+            assert no is None
+        if no is None:
+            assert yes is None

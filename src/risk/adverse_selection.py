@@ -241,18 +241,29 @@ class AdverseSelectionGuard:
         """Detect price momentum that signals informed flow.
 
         Returns a multiplier: 1.0 = normal, >1.0 = widen spread.
+
+        Only considers price moves over a meaningful time window (>= 60s)
+        to avoid false positives from startup or synthetic book transitions.
         """
         state = self.get_state(market_id)
         if len(state.prices) < 5:
             return 1.0
 
-        oldest_price = state.prices[0][1]
-        newest_price = state.prices[-1][1]
-
-        if oldest_price <= 0:
+        # Require at least 60s of price history to avoid startup false positives
+        time_span = state.prices[-1][0] - state.prices[0][0]
+        if time_span < 60:
             return 1.0
 
-        move = abs(newest_price - oldest_price) / oldest_price
+        # Use median of first 3 and last 3 prices to smooth out noise
+        first_prices = [p for _, p in state.prices[:3]]
+        last_prices = [p for _, p in state.prices[-3:]]
+        baseline = sorted(first_prices)[len(first_prices) // 2]
+        current = sorted(last_prices)[len(last_prices) // 2]
+
+        if baseline <= 0:
+            return 1.0
+
+        move = abs(current - baseline) / baseline
 
         if move > self.momentum_threshold:
             # Strong directional move = informed flow
@@ -264,7 +275,7 @@ class AdverseSelectionGuard:
                 market_id=market_id,
                 move_pct=round(move * 100, 2),
                 multiplier=round(multiplier, 2),
-                direction="UP" if newest_price > oldest_price else "DOWN",
+                direction="UP" if current > baseline else "DOWN",
             )
             return multiplier
 

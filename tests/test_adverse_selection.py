@@ -139,8 +139,12 @@ class TestMomentumDetection:
         now = time.time()
         state = guard.get_state("m1")
         # Price moves from 0.50 to 0.55 (10% move > 3% threshold)
-        for i in range(5):
-            state.prices.append((now - 100 + i * 20, 0.50))
+        # Need enough points on both sides for median to reflect the move
+        state.prices.append((now - 120, 0.50))
+        state.prices.append((now - 100, 0.50))
+        state.prices.append((now - 80, 0.50))
+        state.prices.append((now - 20, 0.55))
+        state.prices.append((now - 10, 0.55))
         state.prices.append((now, 0.55))
         mult = guard.detect_momentum("m1")
         assert mult > 1.0

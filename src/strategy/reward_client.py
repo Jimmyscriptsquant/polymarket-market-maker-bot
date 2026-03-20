@@ -71,11 +71,13 @@ class RewardClient:
                     break
 
             markets = []
-            max_affordable_shares = self.settings.capital_pool_usd / self.settings.target_markets_count / 0.50
+            # Allow up to 3x the per-market budget for min_shares
+            # (we place min_shares regardless — reward eligibility requires it)
+            max_affordable_shares = (self.settings.capital_pool_usd / self.settings.target_markets_count / 0.50) * 3
             for item in all_items:
                 info = self._parse_reward_market(item)
                 if info and info.rate_per_day >= self.settings.min_reward_rate_daily:
-                    # Filter out markets we can't afford the minimum shares for
+                    # Filter out markets we truly can't afford
                     if info.min_shares > max_affordable_shares:
                         continue
                     markets.append(info)
