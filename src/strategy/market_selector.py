@@ -96,15 +96,27 @@ class MarketSelector:
                 logger.debug("market_too_volatile", market_id=market.market_id, vol=vol)
                 continue
 
-            # Fetch orderbook to measure actual competition depth
-            # CLOB /book requires token_id — fetch market info if we don't have it
+            # Fetch market meta (token_id + end_date) and orderbook depth
             token_id = market.yes_token_id
+            end_date = ""
             if not token_id:
-                token_id = await self._fetch_yes_token_id(market.market_id)
+                token_id, end_date = await self._fetch_market_meta(market.market_id)
                 if token_id:
                     market.yes_token_id = token_id
             if not token_id:
                 continue
+
+            # Skip markets resolving within 24 hours (high AS risk, low reward value)
+            if end_date:
+                try:
+                    from datetime import datetime
+                    dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                    hours_left = (dt.timestamp() - time.time()) / 3600
+                    if hours_left < 24:
+                        continue
+                except Exception:
+                    pass
+
             book_depth = await self._get_book_depth(token_id)
 
             # Competition: use orderbook depth as primary signal (more reliable than API score)
@@ -146,8 +158,8 @@ class MarketSelector:
         # Sort by efficiency descending
         scored.sort(key=lambda s: s.reward_efficiency, reverse=True)
 
-        # Select top N
-        top_n = scored[: self.settings.target_markets_count]
+        # Return 2x candidates (expiry already filtered, just need buffer for token issues)
+        top_n = scored[: self.settings.target_markets_count * 2]
 
         # Allocate capital proportional to efficiency
         self._allocate_capital(top_n)
@@ -177,8 +189,12 @@ class MarketSelector:
             share = market.reward_efficiency / total_efficiency
             market.allocated_capital = round(pool * share, 2)
 
-    async def _fetch_yes_token_id(self, market_id: str) -> str:
-        """Fetch market info to get the YES token_id (rewards API doesn't include tokens)."""
+    async def _fetch_market_meta(self, market_id: str) -> tuple[str, str]:
+        """Fetch market info to get YES token_id and end_date.
+
+        Returns (yes_token_id, end_date_iso). The rewards API doesn't
+        include tokens or end_date, so we need a separate /markets/ call.
+        """
         try:
             response = await self.reward_client.client.get(
                 f"{self.reward_client.base_url}/markets/{market_id}"
@@ -186,15 +202,18 @@ class MarketSelector:
             response.raise_for_status()
             data = response.json()
             tokens = data.get("tokens", [])
-            # Try YES outcome first, fall back to first token
+            end_date = data.get("end_date_iso") or data.get("end_date") or ""
+            token_id = ""
             for t in tokens:
                 if t.get("outcome", "").upper() == "YES":
-                    return t.get("token_id", "")
-            if tokens:
-                return tokens[0].get("token_id", "")
+                    token_id = t.get("token_id", "")
+                    break
+            if not token_id and tokens:
+                token_id = tokens[0].get("token_id", "")
+            return token_id, end_date
         except Exception:
             pass
-        return ""
+        return "", ""
 
     async def _get_book_depth(self, token_id: str) -> float:
         """Fetch orderbook and return total resting size (bid + ask depth).

@@ -116,34 +116,33 @@ class MarketMakerBot:
             return None
 
     async def discover_reward_markets(self) -> list[dict[str, Any]]:
-        # Request extra candidates since some may be expired or illiquid
-        orig_count = self.settings.target_markets_count
-        self.settings.target_markets_count = orig_count * 5
+        # scan_and_rank selects top N from settings.target_markets_count
         selected = await self.market_selector.scan_and_rank()
-        self.settings.target_markets_count = orig_count
 
         if not selected:
-            logger.warning("no_reward_markets_selected, falling back to configured market")
-            fallback = await self.discover_market()
-            return [fallback] if fallback else []
+            logger.warning("no_reward_markets_selected")
+            # Do NOT fall back to configured market — it may not be sponsored.
+            # Only trade markets with confirmed reward pools.
+            return []
 
         infos = []
         now_ts = time.time()
         for scored in selected:
-            if len(infos) >= orig_count:
+            if len(infos) >= self.settings.target_markets_count:
                 break
             try:
                 info = await self.rest_client.get_market_info(scored.market_id)
 
-                # Skip markets that resolve within 24 hours
+                # Skip markets that resolve within 24 hours — high adverse selection risk
+                # and reward earnings won't accumulate meaningfully
                 end_date = info.get("end_date_iso") or info.get("end_date") or ""
                 if end_date:
                     try:
                         from datetime import datetime
                         dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
                         hours_until = (dt.timestamp() - now_ts) / 3600
-                        if hours_until < 2:
-                            logger.info("skipping_near_resolution_market", market_id=scored.market_id, end_date=end_date, hours_until=round(hours_until, 1))
+                        if hours_until < 24:
+                            logger.info("skipping_near_resolution_market", market_id=scored.market_id, hours_until=round(hours_until, 1))
                             continue
                     except Exception:
                         pass
@@ -426,6 +425,12 @@ class MarketMakerBot:
 
         reward_data = market_info.get("_reward", {})
         reward_rate = reward_data.get("rate_per_day", 0.0)
+
+        # Only quote markets with confirmed reward sponsorship
+        if reward_rate <= 0:
+            logger.warning("skipping_unsponsored_market", market_id=market_id)
+            return
+
         volume_24h = reward_data.get("volume_24h", 0.0)
         breakeven_bps = reward_data.get("breakeven_spread_bps", 0.0)
         allocated_capital = reward_data.get("allocated_capital", 0.0)

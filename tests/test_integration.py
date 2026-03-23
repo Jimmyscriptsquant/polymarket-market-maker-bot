@@ -185,8 +185,8 @@ class TestMarketMakerBotIntegration:
     @pytest.mark.asyncio
     async def test_run_cancel_replace_cycle_single_iteration(self, bot: MarketMakerBot):
         market_infos = [
-            {"id": "m1", "yes_token_id": "y1", "no_token_id": "n1", "_reward": {}},
-            {"id": "m2", "yes_token_id": "y2", "no_token_id": "n2", "_reward": {}},
+            {"id": "m1", "yes_token_id": "y1", "no_token_id": "n1", "_reward": {"rate_per_day": 5.0, "max_spread_bps": 450, "min_shares": 20}},
+            {"id": "m2", "yes_token_id": "y2", "no_token_id": "n2", "_reward": {"rate_per_day": 5.0, "max_spread_bps": 450, "min_shares": 20}},
         ]
 
         for info in market_infos:
