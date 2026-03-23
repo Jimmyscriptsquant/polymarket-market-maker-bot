@@ -66,10 +66,26 @@ class MarketSelector:
             logger.warning("no_reward_markets_found")
             return self._selected_markets
 
-        # Pre-filter: sort by rate and only check book depth for top candidates
-        # This avoids hundreds of API calls for markets we'd never select
-        reward_markets.sort(key=lambda m: m.rate_per_day, reverse=True)
-        candidates = reward_markets[:self.settings.target_markets_count * 8]
+        # Budget per market determines which min_size we can afford
+        budget_per_market = self.settings.capital_pool_usd / self.settings.target_markets_count
+        # At price ~0.25 average, we need min_shares * 0.25 per side
+        max_affordable_min_size = budget_per_market / 0.25
+
+        # Pre-filter: remove markets we can't afford, then sort by rate
+        affordable = [m for m in reward_markets if m.min_shares <= max_affordable_min_size]
+        affordable.sort(key=lambda m: m.rate_per_day, reverse=True)
+
+        # Only check book depth for top candidates (API calls are expensive)
+        candidates = affordable[:self.settings.target_markets_count * 6]
+
+        logger.info(
+            "market_scan_candidates",
+            total_reward_markets=len(reward_markets),
+            affordable=len(affordable),
+            checking_depth=len(candidates),
+            budget_per_market=round(budget_per_market, 1),
+            max_min_size=round(max_affordable_min_size, 0),
+        )
 
         scored: list[ScoredMarket] = []
         for market in candidates:
@@ -98,9 +114,10 @@ class MarketSelector:
 
             vol_adj = max(vol, 0.01)
 
-            # Core efficiency: reward rate / competition depth
-            # Higher = more reward per unit of competition we face
-            efficiency = market.rate_per_day / (comp * vol_adj)
+            # Ranking: rate_per_day² / competition — squaring rate makes high-reward
+            # pools much more attractive (a $50/day pool is 25x better than $10/day
+            # at equal competition, not just 5x)
+            efficiency = (market.rate_per_day ** 2) / (comp * vol_adj)
 
             # Bonus for wider max spread (easier to stay in range)
             spread_bonus = market.max_spread_bps / 450.0  # normalize: 450bps = 1.0
