@@ -106,6 +106,19 @@ class QuoteEngine:
         if mid_price <= 0:
             return (None, None)
 
+        # HARD FILTER: Skip markets with extreme prices entirely.
+        # At mid < 0.05 or > 0.95, one side is nearly worthless (0.01-0.04¢).
+        # Orders at these prices get instantly sniped by informed traders dumping
+        # worthless positions. The reward score isn't worth the adverse selection.
+        if mid_price < 0.05 or mid_price > 0.95:
+            logger.info(
+                "skipping_extreme_price_market",
+                market_id=market_id,
+                mid=round(mid_price, 4),
+                reason="mid too extreme, high snipe risk",
+            )
+            return (None, None)
+
         # Adverse selection protection: if multiplier is high, pull quotes entirely.
         # We can't widen beyond the reward spread (that would lose eligibility),
         # so the safe response to informed flow is to stop quoting temporarily.

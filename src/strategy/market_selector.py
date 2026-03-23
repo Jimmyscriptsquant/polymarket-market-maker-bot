@@ -117,7 +117,13 @@ class MarketSelector:
                 except Exception:
                     pass
 
-            book_depth = await self._get_book_depth(token_id)
+            book_depth, mid = await self._get_book_depth(token_id)
+
+            # Skip extreme midpoints — at mid < 0.10 or > 0.90, one side
+            # trades at pennies and gets instantly sniped by informed traders.
+            # Not worth the reward vs the adverse selection risk.
+            if mid < 0.10 or mid > 0.90:
+                continue
 
             # Competition: use orderbook depth as primary signal (more reliable than API score)
             # Low depth = low competition = we capture bigger share of reward pool
@@ -134,11 +140,6 @@ class MarketSelector:
             # Bonus for wider max spread (easier to stay in range)
             spread_bonus = market.max_spread_bps / 450.0  # normalize: 450bps = 1.0
             efficiency *= spread_bonus
-
-            # Penalty for extreme midpoints (harder to quote both sides profitably)
-            mid = (market.best_bid + market.best_ask) / 2.0 if market.best_bid > 0 and market.best_ask < 1.0 else 0.5
-            if mid < 0.10 or mid > 0.90:
-                efficiency *= 0.3  # heavy penalty — two-sided is mandatory and risky
 
             # Estimate breakeven spread accounting for reward subsidy
             expected_daily_fills = max(market.volume_24h / 100.0, 1.0)
@@ -215,11 +216,12 @@ class MarketSelector:
             pass
         return "", ""
 
-    async def _get_book_depth(self, token_id: str) -> float:
-        """Fetch orderbook and return total resting size (bid + ask depth).
+    async def _get_book_depth(self, token_id: str) -> tuple[float, float]:
+        """Fetch orderbook and return (total depth, mid price).
 
-        This is the best proxy for competition — markets with thin books
+        Depth is the best proxy for competition — markets with thin books
         mean fewer LPs competing for the reward pool.
+        Mid price is used to filter extreme-probability markets.
         """
         try:
             book = await self.reward_client.fetch_orderbook_snapshot(token_id)
@@ -227,9 +229,12 @@ class MarketSelector:
             asks = book.get("asks", [])
             bid_depth = sum(float(b.get("size", 0)) for b in bids)
             ask_depth = sum(float(a.get("size", 0)) for a in asks)
-            return bid_depth + ask_depth
+            best_bid = max((float(b.get("price", 0)) for b in bids), default=0)
+            best_ask = min((float(a.get("price", 0)) for a in asks), default=1)
+            mid = (best_bid + best_ask) / 2.0 if best_bid > 0 and best_ask < 1 else 0.5
+            return bid_depth + ask_depth, mid
         except Exception:
-            return 1000.0  # Conservative default if fetch fails
+            return 1000.0, 0.5  # Conservative defaults if fetch fails
 
     def record_price(self, market_id: str, mid_price: float) -> None:
         """Record a price observation for volatility estimation."""
