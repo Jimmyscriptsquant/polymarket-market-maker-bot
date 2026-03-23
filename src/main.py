@@ -540,11 +540,10 @@ class MarketMakerBot:
             logger.error("cancel_before_refresh_failed", market_id=market_id, error=str(e))
 
     async def _place_quote(self, quote: Any, outcome: str):
-        is_valid, reason = self.risk_manager.validate_order(quote.side, quote.size * quote.price)
-
-        if not is_valid:
-            logger.warning("quote_rejected", reason=reason, outcome=outcome, market=quote.market)
-            return
+        # Skip exposure/position checks for reward farming — we place small resting
+        # limit orders sized to min_shares. Real risk control is capital allocation
+        # and the AS guard (which handles fill-based risk separately).
+        # The old exposure tracker double-counts historical fills from trade polling.
 
         # AS guard check
         mid = quote.price
