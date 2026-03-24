@@ -182,6 +182,34 @@ class QuoteEngine:
         yes_bid_price = math.ceil(yes_bid_price * 100) / 100
         no_bid_price = math.ceil(no_bid_price * 100) / 100
 
+        # CRITICAL: CROSSING GUARD — Never place a bid at or above the best ask.
+        # If our bid >= best_ask, the order will fill immediately as a taker,
+        # costing us money instead of earning rewards. We want RESTING orders only.
+        # Also never bid above best_bid — that makes us the best bid and guarantees fills.
+        if best_ask > 0 and yes_bid_price >= best_ask:
+            logger.warning(
+                "crossing_guard_yes",
+                market_id=market_id,
+                our_bid=yes_bid_price,
+                best_ask=best_ask,
+                action="pulling_yes_quote",
+            )
+            yes_bid_price = 0.0
+
+        # NO side: our no_bid is on the complementary book.
+        # NO bid at X is equivalent to YES ask at (1-X).
+        # If no_bid >= (1 - best_bid), we'd cross the YES bid side.
+        if best_bid > 0 and no_bid_price >= (1.0 - best_bid):
+            logger.warning(
+                "crossing_guard_no",
+                market_id=market_id,
+                our_no_bid=no_bid_price,
+                equiv_yes_ask=round(1.0 - no_bid_price, 4),
+                best_bid=best_bid,
+                action="pulling_no_quote",
+            )
+            no_bid_price = 0.0
+
         # Validate prices are in [0.01, 0.99] range
         if yes_bid_price < 0.01 or yes_bid_price > 0.99:
             yes_bid_price = 0.0

@@ -86,8 +86,19 @@ class MarketMakerBot:
         # Token ID mapping: market_id -> {yes_token_id, no_token_id, neg_risk}
         self._token_map: dict[str, dict[str, Any]] = {}
 
-        # Track last known fill timestamp per market for polling
+        # Track last known fill timestamp per market for polling.
+        # Initialize to NOW so we only count fills that happen AFTER bot starts.
+        # Historical fills would inflate exposure tracking and trigger false caps.
+        self._bot_start_time = int(time.time())
         self._last_fill_check: dict[str, float] = {}
+
+        # Fill-rate tracking: market_id -> list of fill timestamps
+        # If a market fills us too often, we blacklist it temporarily
+        self._fill_timestamps: dict[str, list[float]] = {}
+        self._blacklisted_markets: dict[str, float] = {}  # market_id -> blacklist_until
+        self.MAX_FILLS_PER_HOUR = 3  # More than 3 fills/hour = blacklist
+        self.BLACKLIST_DURATION_S = 3600  # Blacklist for 1 hour
+        self.MAX_POSITION_PER_MARKET_USD = 20.0  # Hard cap per market
 
     # -- API Key Setup -------------------------------------------------------
 
@@ -282,6 +293,23 @@ class MarketMakerBot:
         if hedge:
             asyncio.create_task(self._execute_hedge(market_id, hedge))
 
+        # Track fill rate for blacklisting
+        now = time.time()
+        self._fill_timestamps.setdefault(market_id, []).append(now)
+        # Prune old timestamps
+        cutoff = now - 3600
+        self._fill_timestamps[market_id] = [t for t in self._fill_timestamps[market_id] if t > cutoff]
+
+        # If too many fills in the last hour, blacklist this market
+        if len(self._fill_timestamps[market_id]) >= self.MAX_FILLS_PER_HOUR:
+            self._blacklisted_markets[market_id] = now + self.BLACKLIST_DURATION_S
+            logger.warning(
+                "market_blacklisted_fill_rate",
+                market_id=market_id,
+                fills_per_hour=len(self._fill_timestamps[market_id]),
+                blacklisted_until=self.BLACKLIST_DURATION_S,
+            )
+
         # On fill: cancel all remaining orders in this market to prevent further
         # sniping. Do NOT immediately requote — that creates a fill→requote→fill loop.
         # The normal 60s cycle will place fresh quotes with updated AS state.
@@ -337,13 +365,14 @@ class MarketMakerBot:
                 await asyncio.sleep(10)  # Poll every 10s
 
                 for market_id in list(self.market_infos.keys()):
-                    last_check = self._last_fill_check.get(market_id, 0)
+                    # Default to bot start time — never replay historical fills
+                    last_check = self._last_fill_check.get(market_id, self._bot_start_time)
                     now = int(time.time())
 
                     try:
                         trades = await self.rest_client.get_trades(
                             market=market_id,
-                            after=int(last_check) if last_check > 0 else None,
+                            after=int(last_check),
                         )
 
                         for trade in trades:
@@ -383,6 +412,30 @@ class MarketMakerBot:
             return
 
         self.last_quote_times[market_id] = current_time
+
+        # BLACKLIST CHECK: Skip markets that fill us too often
+        now_s = time.time()
+        blacklist_until = self._blacklisted_markets.get(market_id, 0)
+        if blacklist_until > now_s:
+            logger.info("market_blacklisted_skipping", market_id=market_id,
+                        remaining_s=int(blacklist_until - now_s))
+            self.uptime_tracker.record_tick(market_id, has_live_quotes=False)
+            return
+        elif blacklist_until > 0:
+            # Blacklist expired, remove
+            del self._blacklisted_markets[market_id]
+
+        # POSITION CAP CHECK: Don't quote markets where we already hold too much
+        as_state = self.as_guard.get_state(market_id)
+        total_exposure = as_state.yes_exposure + as_state.no_exposure
+        if total_exposure > self.MAX_POSITION_PER_MARKET_USD:
+            logger.warning("position_cap_reached", market_id=market_id,
+                           exposure=round(total_exposure, 2),
+                           cap=self.MAX_POSITION_PER_MARKET_USD)
+            # Cancel any remaining orders — don't add more risk
+            await self._cancel_all_market_orders(market_id)
+            self.uptime_tracker.record_tick(market_id, has_live_quotes=False)
+            return
 
         # Check drawdown limits before quoting
         dd_ok, dd_reason = self.inventory_manager.check_drawdown_limit()
